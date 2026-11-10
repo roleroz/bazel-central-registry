@@ -14,16 +14,16 @@
             "name": "David Benjamin"
         },
         {
-            "email": "dadrian@google.com",
-            "github": "dadrian",
-            "github_user_id": 1158264,
-            "name": "David Adrian"
-        },
-        {
             "email": "chlily@google.com",
             "github": "chlily1",
             "github_user_id": 45374074,
             "name": "Lily Chen"
+        },
+        {
+            "email": "xfding@google.com",
+            "github": "dingxiangfei2009",
+            "github_user_id": 6884440,
+            "name": "Xiangfei Ding"
         }
     ],
     "repository": [
@@ -48,7 +48,20 @@
         "0.20250818.0",
         "0.20251002.0",
         "0.20251110.0",
-        "0.20251124.0"
+        "0.20251124.0",
+        "0.20260204.0",
+        "0.20260211.0",
+        "0.20260327.0",
+        "0.20260413.0",
+        "0.20260508.0",
+        "0.20260526.0",
+        "0.20260616.0",
+        "0.20260713.0",
+        "0.20260730.0",
+        "0.20260803.0",
+        "0.20260813.0",
+        "0.20260929.0",
+        "0.20261020.0"
     ],
     "yanked_versions": {}
 }

@@ -24,7 +24,9 @@
         "github:google/j2cl"
     ],
     "versions": [
-        "20250630"
+        "20250630",
+        "20260402",
+        "20261026"
     ],
     "yanked_versions": {}
 }

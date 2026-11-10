@@ -1,5 +1,5 @@
 {
-    "homepage": "https://github.com/bazelbuild/rules_kotlin",
+    "homepage": "https://github.com/bazel-contrib/rules_kotlin",
     "maintainers": [
         {
             "email": "ben@ben.cm",
@@ -21,6 +21,7 @@
         }
     ],
     "repository": [
+        "github:bazel-contrib/rules_kotlin",
         "github:bazelbuild/rules_kotlin"
     ],
     "versions": [
@@ -40,7 +41,14 @@
         "2.1.10",
         "2.2.0",
         "2.2.1",
-        "2.2.2"
+        "2.2.2",
+        "2.3.0",
+        "2.3.10",
+        "2.3.20",
+        "2.4.0",
+        "2.4.10",
+        "2.4.20",
+        "2.4.21"
     ],
     "yanked_versions": {}
 }

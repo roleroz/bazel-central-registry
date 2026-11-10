@@ -24,7 +24,7 @@ Validations performed are:
   - Verify the source archive URL is stable
   - Verify if the presubmit.yml file matches the previous version
     - If not, we should require BCR maintainer review.
-  - Verify the checked in MODULE.bazel file matches the one in the extracted and patched source tree.
+  - Verify the patches and overlay files apply to the source archive.
   - Verify attestations (SLSA provenance / VSA) referenced by attestations.json (if it exists).
 """
 
@@ -37,8 +37,10 @@ import requests
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import yaml
+import zstandard
 
 from difflib import unified_diff
 from enum import Enum
@@ -89,6 +91,16 @@ GITHUB_URL_RE = re.compile(r"^https://github.com/([^/]+/[^/]+)")
 # Global cache for GitHub user IDs
 GITHUB_USER_ID_CACHE = {}
 
+# For the following modules, going from a release with attestations to one without
+# is merely a warning, not a fatal error.
+# TODO(fweikert): enforce compliance once attestation feature is more widely used.
+ATTESTATION_HISTORY_CHECK_OPT_OUT = frozenset(
+    [
+        "gcc_toolchain",  # unmaintained or just very slow to respond
+        "protobuf",  # accidentally introduced attestations.json
+    ]
+)
+
 
 def print_collapsed_group(name):
     print("\n\n--- {0}\n\n".format(name))
@@ -125,20 +137,6 @@ def apply_patch(work_dir, patch_strip, patch_file):
     )
 
 
-def run_git(*args):
-    # Requires git to be installed
-    subprocess.run(
-        ["git", *args],
-        shell=False,
-        check=True,
-        env=os.environ,
-    )
-
-
-def fix_line_endings(lines):
-    return [line.rstrip() + "\n" for line in lines]
-
-
 def extract_reference(repo_path, path):
     """
     Extracts the reference from a path matching the pattern /<repo_path>/archive/<ref>.zip or /<repo_path>/archive/<ref>.tar.gz
@@ -171,9 +169,12 @@ def is_ref_in_original_repo(repo_path, reference) -> bool:
         True if the reference is found AND not spoofed; False otherwise
     """
 
-    # Make sure the reference is not a pull request
-    # e.g. refs/pull/1234/head
-    if re.match(r"^pull/\d+/head$", reference):
+    # Make sure the reference is not a pull request.
+    # GitHub archive URLs carry the full ref form (e.g. "refs/pull/1234/head").
+    # Such refs exist in the base repo's namespace but point at commits the
+    # project has not reviewed or accepted, so reject both the bare and "refs/"-
+    # prefixed forms, covering "/merge" as well as "/head".
+    if re.match(r"^(refs/)?pull/\d+/(head|merge)$", reference):
         return False
 
     url = f"https://github.com/{repo_path}/latest-commit/{reference}"
@@ -307,23 +308,10 @@ class BcrValidator:
     def verify_source_archive_url_match_github_repo(self, module_name, version):
         """Verify the source archive URL matches the github repo. For now, we only support github repositories check."""
         source = self.registry.get_source(module_name, version)
-        if source.get("type", None) == "git_repository":
-            source_url = source["remote"]
-            # Preprocess the git URL to make the comparison easier.
-            if source_url.startswith("git@"):
-                source_url = source_url.removeprefix("git@")
-                source_netloc, source_parts = source_url.split(":")
-                source_url = "https://" + source_netloc + "/" + source_parts
-            if source_url.endswith(".git"):
-                source_url = source_url.removesuffix(".git")
-            # Make the commit look like a GitHub archive to unify the
-            # rest of this check. For non-GitHub repositories, the extra
-            # trailing parts are ignored.
-            commit = source["commit"]
-            source_url = source_url.rstrip("/")
-            source_url = f"{source_url}/archive/{commit}.zip"
-        else:
-            source_url = source["url"]
+        if source.get("type", "archive") != "archive":
+            raise BcrValidationException('Module source "type" must be "archive" (the default)')
+
+        source_url = source["url"]
         source_repositories = self.registry.get_metadata(module_name).get("repository", [])
         matched = not source_repositories
         for source_repository in source_repositories:
@@ -359,8 +347,6 @@ class BcrValidator:
 
     def verify_source_archive_url_stability(self, module_name, version):
         """Verify source archive URL is stable"""
-        if self.registry.get_source(module_name, version).get("type", None) == "git_repository":
-            return
         source_url = self.registry.get_source(module_name, version)["url"]
         if verify_stable_archive(source_url) == UrlStability.UNSTABLE:
             self.report(
@@ -380,9 +366,6 @@ class BcrValidator:
     def verify_source_archive_url_integrity(self, module_name, version):
         """Verify the integrity value of the URL and mirror URLs is correct."""
         source = self.registry.get_source(module_name, version)
-        if source.get("type", None) == "git_repository":
-            return
-
         expected_integrity = source["integrity"]
         urls_to_check = [(source["url"], "main source archive URL")]
 
@@ -414,47 +397,8 @@ class BcrValidator:
                 "The source archive's integrity value matches all provided URLs.",
             )
 
-    def verify_git_repo_source_stability(self, module_name, version):
-        """Verify git repositories are specified in a stable way."""
-        if self.registry.get_source(module_name, version).get("type", None) != "git_repository":
-            return
-
-        # There's a handful of failure modes here, don't fail fast.
-        error_encountered = False
-        if self.registry.get_source(module_name, version).get("branch", None):
-            self.report(
-                BcrValidationResult.FAILED,
-                f"{module_name}@{version}'s source is a git_repository that is trying to track "
-                "a branch. Please use a specific commit instead, as branches are not stable sources.",
-            )
-            error_encountered = True
-        if self.registry.get_source(module_name, version).get("tag", None):
-            self.report(
-                BcrValidationResult.FAILED,
-                f"{module_name}@{version}'s source is a git_repository that is trying to track "
-                "a tag. Please use a specific commit instead, as tags are not stable sources.",
-            )
-            error_encountered = True
-        commit = self.registry.get_source(module_name, version)["commit"]
-        try:
-            commit_hash_bytes = bytes.fromhex(commit)
-            if len(commit_hash_bytes) != 20:
-                self.report(
-                    BcrValidationResult.FAILED,
-                    f"{module_name}@{version}'s git_repository commit hash is an unexpected length.",
-                )
-        except ValueError:
-            self.report(
-                BcrValidationResult.FAILED,
-                f"{module_name}@{version}'s source is a git_repository with an invalid commit hash format.",
-            )
-            error_encountered = True
-
-        if not error_encountered:
-            self.report(BcrValidationResult.GOOD, "The git_repository appears stable.")
-
     def verify_presubmit_yml_change(self, module_name, version):
-        """Verify if the presubmit.yml is the same as the previous version."""
+        """Verify if the presubmit.yml is similar enough to the previous version."""
         latest_snapshot = self.upstream.get_latest_module_version(module_name)
         if not latest_snapshot:
             self.report(
@@ -462,43 +406,60 @@ class BcrValidator:
                 f"Module version {module_name}@{version} is new, the presubmit.yml file "
                 "should be reviewed by a BCR maintainer.",
             )
-        else:
-            previous_presubmit_content = latest_snapshot.presubmit_yml_lines()
-            current_presubmit_yml = self.registry.get_presubmit_yml_path(module_name, version)
-            current_presubmit_content = open(current_presubmit_yml, "r").readlines()
-            diff = list(
-                unified_diff(
-                    previous_presubmit_content,
-                    current_presubmit_content,
-                    fromfile="HEAD",
-                    tofile=str(current_presubmit_yml),
-                )
-            )
-            if diff:
-                self.report(
-                    BcrValidationResult.NEED_BCR_MAINTAINER_REVIEW,
-                    f"The presubmit.yml file of {module_name}@{version} doesn't match its previous version "
-                    f"{module_name}@{latest_snapshot.version}, the following presubmit.yml file change "
-                    "should be reviewed by a BCR maintainer.\n    " + "    ".join(diff),
-                )
-            else:
-                self.report(
-                    BcrValidationResult.GOOD,
-                    "The presubmit.yml file matches the previous version.",
-                )
+            return
 
-    def add_module_dot_bazel_patch(self, diff, module_name, version):
-        """Adding a patch file for MODULE.bazel according to the diff result."""
-        source = self.registry.get_source(module_name, version)
-        patch_file = self.registry.get_patch_file_path(module_name, version, "module_dot_bazel.patch")
-        patch_file.parent.mkdir(parents=True, exist_ok=True)
-        open(patch_file, "w").writelines(diff)
-        source["patch_strip"] = int(source.get("patch_strip", 0))
-        patches = source.get("patches", {})
-        patches["module_dot_bazel.patch"] = integrity(read(patch_file))
-        source["patches"] = patches
-        source_json_content = json.dumps(source, indent=4) + "\n"
-        self.registry.get_source_json_path(module_name, version).write_text(source_json_content)
+        # Load the current yaml from the local fork but the previous yml from upstream.
+        # (The local fork might not have merged the latest upstream changes.)
+        previous_presubmit_lines = latest_snapshot.presubmit_yml_lines()
+        current_presubmit_yml = self.registry.get_presubmit_yml_path(module_name, version)
+        current_presubmit_lines = open(current_presubmit_yml, "r").readlines()
+
+        # When nothing at all is changed, we don't even need to parse the documents.
+        if current_presubmit_lines == previous_presubmit_lines:
+            self.report(
+                BcrValidationResult.GOOD,
+                "The presubmit.yml file exactly matches the previous version.",
+            )
+            return
+
+        # We'll compare the parsed representation of the two presubmit.yml files.
+        # Differences in only comments / whitespace don't need BCR maintainer review.
+        previous_presubmit_doc = yaml.safe_load("".join(previous_presubmit_lines))
+        current_presubmit_doc = yaml.safe_load("".join(current_presubmit_lines))
+        if current_presubmit_doc == previous_presubmit_doc:
+            self.report(
+                BcrValidationResult.GOOD,
+                "The presubmit.yml file matches the previous version, modulo comments and whitespace.",
+            )
+            return
+
+        # Differences in only platform names or bazel versions don't need BCR maintainer review.
+        for doc in (previous_presubmit_doc, current_presubmit_doc):
+            for matrixed_node in (doc, doc.setdefault("bcr_test_module", {})):
+                for scrub in ("bazel", "platform"):
+                    matrixed_node.setdefault("matrix", {})[scrub] = None
+        if current_presubmit_doc == previous_presubmit_doc:
+            self.report(
+                BcrValidationResult.GOOD,
+                "The presubmit.yml file matches the previous version, modulo supported platforms and versions.",
+            )
+            return
+
+        # The files were not similar enough. Flag for BCR maintainer review.
+        diff = list(
+            unified_diff(
+                previous_presubmit_lines,
+                current_presubmit_lines,
+                fromfile="HEAD",
+                tofile=str(current_presubmit_yml),
+            )
+        )
+        self.report(
+            BcrValidationResult.NEED_BCR_MAINTAINER_REVIEW,
+            f"The presubmit.yml file of {module_name}@{version} differs from its previous version "
+            f"{module_name}@{latest_snapshot.version}, the following presubmit.yml file change "
+            "should be reviewed by a BCR maintainer.\n    " + "    ".join(diff),
+        )
 
     def _download_source_archive(self, source, output_dir):
         source_url = source["url"]
@@ -508,6 +469,22 @@ class BcrValidator:
         # Use archive_type from source.json if specified, otherwise let shutil guess from filename
         # https://bazel.build/rules/lib/repo/http#http_archive-type
         # https://docs.python.org/3/library/shutil.html#shutil.unpack_archive
+        archive_type = source.get("archive_type")
+        if not archive_type:
+            for ext in ["tar.gz", "tgz", "tar.bz2", "tar.xz", "tar.zst", "tzst", "tar", "zip", "jar", "war", "aar"]:
+                if str(archive_file).endswith("." + ext):
+                    archive_type = ext
+                    break
+        # shutil has no native zstd support, so stream-decompress with the
+        # `zstandard` package straight into tarfile.
+        if archive_type in ("tar.zst", "tzst"):
+            with open(archive_file, "rb") as fh, zstandard.ZstdDecompressor().stream_reader(fh) as reader:
+                with tarfile.open(fileobj=reader, mode="r|") as tar:
+                    if sys.version_info >= (3, 12):
+                        tar.extractall(output_dir, filter="data")
+                    else:
+                        tar.extractall(output_dir)
+            return
         format = {
             "tar.gz": "gztar",
             "tgz": "gztar",
@@ -518,13 +495,13 @@ class BcrValidator:
             "jar": "zip",
             "war": "zip",
             "aar": "zip",
-        }.get(source.get("archive_type"))
-        shutil.unpack_archive(str(archive_file), output_dir, format=format)
-
-    def _download_git_repo(self, source, output_dir):
-        run_git("clone", "--depth=1", source["remote"], output_dir)
-        run_git("-C", output_dir, "fetch", "--depth=1", "origin", source["commit"])
-        run_git("-C", output_dir, "checkout", source["commit"])
+        }.get(archive_type)
+        # Use PEP 706 safe extraction if available (Python 3.12+)
+        if sys.version_info >= (3, 12) and format != "zip":
+            shutil.unpack_archive(str(archive_file), output_dir, format=format, filter="data")
+        else:
+            # Fallback for older Python versions. Since CI is 3.12+, this handles local dev compatibility.
+            shutil.unpack_archive(str(archive_file), output_dir, format=format)
 
     @staticmethod
     def extract_attribute_from_module(module_dot_bazel_file, attribute, default=None):
@@ -548,15 +525,38 @@ class BcrValidator:
 
     def verify_module_dot_bazel(self, module_name, version, check_compatibility_level=True):
         source = self.registry.get_source(module_name, version)
+        if source.get("type", "archive") != "archive":
+            raise BcrValidationException('Module source "type" must be "archive" (the default)')
+
         tmp_dir = Path(tempfile.mkdtemp())
         output_dir = tmp_dir.joinpath("source_root")
-        source_type = source.get("type", "archive")
-        if source_type == "archive":
-            self._download_source_archive(source, output_dir)
-        elif source_type == "git_repository":
-            self._download_git_repo(source, output_dir)
-        else:
-            raise BcrValidationException("Unsupported repository type")
+        # Validate the stripped output directory.
+        strip_prefix = source.get("strip_prefix", "")
+        if strip_prefix:
+            candidate = (output_dir / strip_prefix).resolve()
+            try:
+                candidate.relative_to(output_dir.resolve())
+            except ValueError:
+                error_msg = (
+                    "CRITICAL FAILURE: "
+                    f"strip_prefix '{strip_prefix}' resolves outside the "
+                    f"extraction directory. Resolved to: {candidate}"
+                )
+                self.report(BcrValidationResult.FAILED, error_msg)
+                shutil.rmtree(tmp_dir)
+                raise BcrValidationException(error_msg)
+        source_root = output_dir / strip_prefix
+
+        self._download_source_archive(source, output_dir)
+
+        if not source_root.is_dir():
+            error_msg = (
+                f"Source root '{source_root}' is not a directory; "
+                f"strip_prefix '{strip_prefix}' may not match the archive layout."
+            )
+            self.report(BcrValidationResult.FAILED, error_msg)
+            shutil.rmtree(tmp_dir)
+            return
 
         module_file = self.registry.get_module_dot_bazel_path(module_name, version)
         if module_file.is_symlink():
@@ -580,7 +580,7 @@ class BcrValidator:
                         f"The patch file `{patch_name}` is a symlink to `{patch_file.readlink()}`, "
                         "which is not allowed because https://raw.githubusercontent.com/ will not follow it.",
                     )
-                apply_patch(source_root, source["patch_strip"], str(patch_file.resolve()))
+                apply_patch(source_root, int(source.get("patch_strip", 0)), str(patch_file.resolve()))
         if "overlay" in source:
             overlay_dir = self.registry.get_overlay_dir(module_name, version)
             for overlay_file, expected_integrity in source["overlay"].items():
@@ -618,37 +618,9 @@ class BcrValidator:
                 overlay_dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(overlay_src, overlay_dst)
 
+        # The source archive's MODULE.bazel doesn't need to match the checked in one: Bazel resolves the module
+        # with the latter and, as of 7.7.0 and 8.4.0, also replaces the former with it when fetching the module.
         bcr_module_dot_bazel = self.registry.get_module_dot_bazel_path(module_name, version)
-        source_module_dot_bazel = source_root.joinpath("MODULE.bazel")
-        if source_module_dot_bazel.exists():
-            source_module_dot_bazel_content = open(source_module_dot_bazel, "r").readlines()
-            bcr_module_dot_bazel_content = open(bcr_module_dot_bazel, "r").readlines()
-            source_module_dot_bazel_content = fix_line_endings(source_module_dot_bazel_content)
-            bcr_module_dot_bazel_content = fix_line_endings(bcr_module_dot_bazel_content)
-            file_name = "a/" * int(source.get("patch_strip", 0)) + "MODULE.bazel"
-            diff = list(
-                unified_diff(
-                    source_module_dot_bazel_content,
-                    bcr_module_dot_bazel_content,
-                    fromfile=file_name,
-                    tofile=file_name,
-                )
-            )
-
-            if diff:
-                self.report(
-                    BcrValidationResult.FAILED,
-                    "Checked in MODULE.bazel file doesn't match the one in the extracted and patched sources.\n"
-                    + f"Please fix the MODULE.bazel file or you can add the following patch to {module_name}@{version}:\n"
-                    + "    "
-                    + "    ".join(diff),
-                )
-                if self.should_fix:
-                    self.add_module_dot_bazel_patch(diff, module_name, version)
-            else:
-                self.report(BcrValidationResult.GOOD, "Checked in MODULE.bazel matches the sources.")
-        else:
-            self.report(BcrValidationResult.GOOD, "No MODULE.bazel in the source archive.")
 
         # Check the version in MODULE.bazel matches the version in directory name
         version_in_module_dot_bazel = BcrValidator.extract_attribute_from_module(bcr_module_dot_bazel, "version")
@@ -779,7 +751,6 @@ class BcrValidator:
     def validate_module(self, module_name, version, skipped_validations):
         print_expanded_group(f"Validating {module_name}@{version}")
         self.verify_module_existence(module_name, version)
-        self.verify_git_repo_source_stability(module_name, version)
         if "source_repo" not in skipped_validations:
             self.verify_source_archive_url_match_github_repo(module_name, version)
         if "url_stability" not in skipped_validations:
@@ -867,8 +838,13 @@ class BcrValidator:
         attestations_json = self.registry.get_attestations(module_name, version)
         if not attestations_json:
             if head_attestations_json:  # Prevent regressions.
+                verdict = (
+                    BcrValidationResult.NEED_BCR_MAINTAINER_REVIEW
+                    if module_name in ATTESTATION_HISTORY_CHECK_OPT_OUT
+                    else BcrValidationResult.FAILED
+                )
                 self.report(
-                    BcrValidationResult.FAILED,
+                    verdict,
                     f"{module_name}@{version}: No attestations.json file even though "
                     f"{module_name}@{head_snapshot.version} has one.",
                 )
@@ -923,7 +899,7 @@ class BcrValidator:
         tmp_dir = tempfile.mkdtemp()
         for attestation in attestations:
             try:
-                self._verifier.run(attestation, source_uri, version, tmp_dir)
+                self._verifier.run(module_name, attestation, source_uri, version, tmp_dir)
             except attestations_lib.Error as ex:
                 self.report(BcrValidationResult.FAILED, f"{module_name}@{version}: {ex}")
                 success = False

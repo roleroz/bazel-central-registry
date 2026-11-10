@@ -1,0 +1,19 @@
+{
+    "homepage": "https://software.sil.org/teckit/",
+    "maintainers": [
+        {
+            "email": "26427366+UebelAndre@users.noreply.github.com",
+            "github": "UebelAndre",
+            "github_user_id": 26427366,
+            "name": "UebelAndre"
+        }
+    ],
+    "repository": [
+        "github:silnrsi/teckit"
+    ],
+    "versions": [
+        "2.5.12",
+        "2.5.12.bcr.1"
+    ],
+    "yanked_versions": {}
+}

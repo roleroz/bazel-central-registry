@@ -1,0 +1,29 @@
+{
+    "homepage": "https://github.com/Xilinx/bootgen/",
+    "maintainers": [
+        {
+            "email": "26427366+UebelAndre@users.noreply.github.com",
+            "github": "UebelAndre",
+            "github_user_id": 26427366,
+            "name": "UebelAndre"
+        }
+    ],
+    "repository": [
+        "github:Xilinx/bootgen"
+    ],
+    "versions": [
+        "2024.2",
+        "2024.2.bcr.1",
+        "2025.1",
+        "2025.1.bcr.1",
+        "2025.2",
+        "2025.2.bcr.1",
+        "2025.2.bcr.2",
+        "2026.1.1",
+        "2026.1.1.bcr.1",
+        "2026.2"
+    ],
+    "yanked_versions": {
+        "2025.2": "Built from the xilinx_v2024.2 sources (wrong tarball); use 2025.2.bcr.2"
+    }
+}
